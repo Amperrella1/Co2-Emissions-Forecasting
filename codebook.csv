@@ -1,0 +1,5 @@
+column,description,unit,source
+country,Country - Geographic location.,,Our World in Data - Regions (2023)
+year,Year - Year of observation.,,Our World in Data - Regions (2023)
+gdp,Gross domestic product (GDP) - This data is adjusted for inflation and differences in the cost of living between countries.,international-$ in 2011 prices,Bolt and van Zanden - Maddison Project Database 2023 [https://www.rug.nl/ggdc/historicaldevelopment/maddison/releases/maddison-project-database-2023]
+co2,"Annual CO₂ emissions - Annual total emissions of carbon dioxide (CO₂), excluding land-use change, measured in million tonnes.",million tonnes,Global Carbon Budget (2024) [https://globalcarbonbudget.org/]

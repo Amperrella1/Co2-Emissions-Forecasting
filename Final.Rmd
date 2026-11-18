@@ -1,0 +1,148 @@
+---
+title: "Forecasting annual CO₂ emissions"
+output:
+  github_document:
+    html_preview: false
+---
+
+## Emissions and economic output
+
+The first chart shows the emissions intensity of economic output. The forecasting models that follow predict annual emissions in million tonnes.
+
+```{r setup, message=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(forecast)
+library(ggplot2)
+library(xgboost)
+
+set.seed(42)
+df <- read.csv("data/co2-gdp.csv")
+df <- df[order(df$country, df$year), ]
+countries <- c("United States", "China", "Germany", "Canada", "Bangladesh")
+
+ggplot(df, aes(year, co2 * 1e9 / gdp, colour = country)) +
+  geom_line() +
+  labs(x = "Year", y = "kg CO₂ per 2011 international dollar", colour = NULL) +
+  theme_minimal()
+```
+
+## Ten-year holdout
+
+Each model forecasts 2013–2022 from the end of 2012. GDP for the forecast years is supplied as an observed input, so forecasts from models that use GDP are conditional on its realized path. Training starts at the beginning of each country's last uninterrupted series so a one-year lag always spans one calendar year.
+
+```{r features}
+country_series <- function(country_name) {
+  series <- df[df$country == country_name, ]
+  gaps <- which(diff(series$year) != 1)
+  if (length(gaps)) series <- series[(max(gaps) + 1):nrow(series), ]
+  series
+}
+
+feature_row <- function(history, gdp, year) {
+  recent <- tail(history, 3)
+  c(lag1 = recent[3], lag2 = recent[2], lag3 = recent[1],
+    rollmean_3 = mean(recent), rollsd_3 = sd(recent), gdp = gdp, year = year)
+}
+
+training_features <- function(values, train) {
+  t(vapply(4:length(values), function(i) {
+    feature_row(values[(i - 3):(i - 1)], train$gdp[i], train$year[i])
+  }, numeric(7)))
+}
+
+fit_booster <- function(x, y, hybrid) {
+  params <- list(objective = "reg:squarederror", nthread = 1)
+  if (hybrid) {
+    params$eta <- 0.1
+    params$max_depth <- 3
+  }
+  xgb.train(params, xgb.DMatrix(x, label = as.numeric(y)),
+            nrounds = if (hybrid) 300 else 100, verbose = 0)
+}
+
+# A forecast becomes part of the emissions history for the following year.
+recursive_forecast <- function(model, history, test, adjustment) {
+  prediction <- numeric(nrow(test))
+  for (i in seq_along(prediction)) {
+    x <- rbind(feature_row(history, test$gdp[i], test$year[i]))
+    prediction[i] <- as.numeric(predict(model, x)) + adjustment[i]
+    history <- c(history, prediction[i])
+  }
+  prediction
+}
+```
+
+## ARIMA and XGBoost
+
+The baseline is ARIMA(3,1,0) with drift. Annual observations have no within-year seasonal component. XGBoost uses three emissions lags, their mean and standard deviation, GDP, and calendar year. China and Bangladesh are also fitted on the log scale. All errors are measured in million tonnes after converting predictions back to the original scale.
+
+```{r baseline}
+forecast_country <- function(cty, log_scale = FALSE, hybrids = FALSE) {
+  series <- country_series(cty)
+  train <- subset(series, year < 2013)
+  test <- subset(series, year >= 2013)
+  stopifnot(identical(as.integer(test$year), 2013:2022))
+  y <- if (log_scale) log(train$co2) else train$co2
+  h <- nrow(test)
+  arima <- Arima(ts(y, start = train$year[1]), order = c(3, 1, 0), include.drift = TRUE)
+  baseline <- as.numeric(forecast(arima, h = h)$mean)
+  x <- training_features(y, train)
+  rows <- 4:length(y)
+  booster <- fit_booster(x, y[rows], hybrid = FALSE)
+  predictions <- list(ARIMA = baseline, XGBoost = recursive_forecast(booster, y, test, numeric(h)))
+
+  if (hybrids) {
+    # Fit the booster to ARIMA residuals for the same training years as x.
+    residual_booster <- fit_booster(x, residuals(arima)[rows], hybrid = TRUE)
+    predictions[["ARIMA + XGBoost residuals"]] <- recursive_forecast(residual_booster, y, test, baseline)
+
+    # Reverse the order and model the booster's in-sample residuals with AR(3).
+    primary_booster <- fit_booster(x, y[rows], hybrid = TRUE)
+    residual_series <- ts(y[rows] - predict(primary_booster, x), start = train$year[4])
+    residual_ar <- Arima(residual_series, order = c(3, 0, 0))
+    correction <- as.numeric(forecast(residual_ar, h = h)$mean)
+    predictions[["XGBoost + AR residuals"]] <- recursive_forecast(primary_booster, y, test, correction)
+  }
+
+  do.call(rbind, lapply(names(predictions), function(method) {
+    estimate <- predictions[[method]]
+    data.frame(country = cty, year = test$year, actual = test$co2,
+               predicted = if (log_scale) exp(estimate) else estimate,
+               method = method, scale = if (log_scale) "Log" else "Level")
+  }))
+}
+
+level <- do.call(rbind, lapply(countries, forecast_country))
+log_results <- rbind(forecast_country("China", TRUE, TRUE), forecast_country("Bangladesh", TRUE))
+results <- rbind(level, log_results)
+```
+
+## Forecasts and errors
+
+The China log-scale comparison includes both hybrid specifications. One adds an XGBoost residual forecast to ARIMA. The other adds an autoregressive residual forecast to XGBoost.
+
+```{r comparison, fig.width=10, fig.height=7}
+plot_forecasts <- function(dat) {
+  observed <- unique(dat[c("country", "year", "actual")])
+  ggplot(dat, aes(year, predicted, colour = method)) +
+    geom_line() +
+    geom_line(data = observed, aes(year, actual), inherit.aes = FALSE, linewidth = 0.8) +
+    facet_wrap(~country, scales = "free_y") +
+    labs(x = "Year", y = "Annual CO₂ emissions (Mt)", colour = "Model",
+         caption = "Black line shows observed emissions.") +
+    theme_minimal() + theme(legend.position = "bottom")
+}
+
+plot_forecasts(level)
+plot_forecasts(log_results)
+```
+
+```{r accuracy}
+stopifnot(all(is.finite(results$predicted)))
+errors <- transform(results, squared = (actual - predicted)^2, absolute = abs(actual - predicted))
+scores <- aggregate(cbind(squared, absolute) ~ country + scale + method, data = errors, FUN = mean)
+scores$RMSE <- sqrt(scores$squared)
+names(scores)[names(scores) == "absolute"] <- "MAE"
+scores <- scores[order(scores$country, scores$scale, scores$RMSE), c("country", "scale", "method", "RMSE", "MAE")]
+knitr::kable(scores, digits = 2)
+```
